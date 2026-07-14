@@ -4,76 +4,50 @@ import random
 import subprocess
 import os
 import signal
-import time
+import platform
 
-RTSP_PORT = 8554
-CRLF = "\r\n"
+RTSP_PORT         = 8554
+CRLF              = "\r\n"
+AUDIO_PORT_OFFSET = 16
 
-STATE_INIT = 0
-STATE_READY = 1
+STATE_INIT    = 0
+STATE_READY   = 1
 STATE_PLAYING = 2
 
-AUDIO_PORT_OFFSET = 16
-DEFAULT_VIDEO_PORT = 5004
-DEFAULT_AUDIO_PORT = 5020
 
-DEFAULT_WIDTH = 1280
-DEFAULT_HEIGHT = 720
-
-SESSION_ID_MIN = 100000
-SESSION_ID_MAX = 999999
-
-CLIENT_RECV_TIMEOUT = 30.0
-SOCKET_RECV_SIZE = 4096
-FFMPEG_STOP_TIMEOUT = 3
-PROBE_TIMEOUT = 5
-
-VIDEO_CODEC = "libx264"
-VIDEO_PRESET = "ultrafast"
-VIDEO_TUNE = "zerolatency"
-VIDEO_BITRATE = "800k"
-VIDEO_MAXRATE = "900k"
-VIDEO_BUFSIZE = "1600k"
-VIDEO_GOP = "60"
-
-AUDIO_CODEC = "libmp3lame"
-AUDIO_BITRATE = "128k"
-AUDIO_SAMPLE_RATE = "44100"
-AUDIO_CHANNELS = "2"
-
-RESPONSE_REASONS = {
-    200: "OK",
-    400: "Bad Request",
-    404: "Not Found",
-    455: "Method Not Valid in This State",
-    501: "Not Implemented",
-}
-
-RTSP_PUBLIC_METHODS = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN"
+def get_camera_input():
+    """
+    Returns the ffmpeg -f and -i arguments for the webcam
+    depending on the operating system.
+    """
+    system = platform.system()
+    if system == "Windows":
+        return ["-f", "dshow",      "-i", "video=Integrated Webcam"]
+    elif system == "Darwin":        # macOS
+        return ["-f", "avfoundation", "-i", "0"]
+    else:                           # Linux
+        return ["-f", "v4l2",       "-i", "/dev/video0"]
 
 
 class RTSPServerWorker(threading.Thread):
-    def __init__(self, client_socket: socket.socket, client_address):
+    def __init__(self, client_socket, client_address):
         super().__init__(daemon=True)
-        self.client_socket = client_socket
+        self.client_socket  = client_socket
         self.client_address = client_address
-        self.state = STATE_INIT
-        self.session_id = str(random.randint(SESSION_ID_MIN, SESSION_ID_MAX))
-        self.video_file = None
+        self.state          = STATE_INIT
+        self.session_id     = str(random.randint(100000, 999999))
         self.client_rtp_port = None
-        self.ffmpeg_proc = None
-        self.cseq = 1
-        self.elapsed = 0.0
-        self.play_start_time = None
+        self.ffmpeg_proc    = None
+        self.cseq           = 1
 
     def run(self):
         print(f"[RTSP] Client connected: {self.client_address}")
-        self.client_socket.settimeout(CLIENT_RECV_TIMEOUT)
+        self.client_socket.settimeout(30.0)
         try:
             buf = ""
             while True:
                 try:
-                    chunk = self.client_socket.recv(SOCKET_RECV_SIZE).decode("utf-8", errors="ignore")
+                    chunk = self.client_socket.recv(4096).decode("utf-8", errors="ignore")
                 except socket.timeout:
                     continue
                 if not chunk:
@@ -90,11 +64,11 @@ class RTSPServerWorker(threading.Thread):
             self.client_socket.close()
             print(f"[RTSP] Client {self.client_address} disconnected.")
 
-    def handle_rtsp_request(self, message: str):
-        lines = message.split(CRLF)
+    def handle_rtsp_request(self, message):
+        lines  = message.split(CRLF)
         if not lines:
             return
-        parts = lines[0].split()
+        parts  = lines[0].split()
         if len(parts) < 2:
             return
         method = parts[0]
@@ -123,23 +97,13 @@ class RTSPServerWorker(threading.Thread):
 
     def handle_options(self, parts, headers, cseq):
         self.send_response(200, cseq, {
-            "Public": RTSP_PUBLIC_METHODS
+            "Public": "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN"
         })
 
     def handle_describe(self, parts, headers, cseq):
-        url = parts[1] if len(parts) > 1 else ""
-        self.video_file = self._extract_path(url)
-
-        if not os.path.isfile(self.video_file):
-            print(f"[RTSP] File not found: {self.video_file}")
-            self.send_response(404, cseq)
-            return
-
-        has_audio = self._probe_has_audio(self.video_file)
-        w, h = self._probe_dimensions(self.video_file)
-        print(f"[RTSP] Video: {self.video_file}  {w}x{h}  audio={has_audio}")
-
-        sdp = self._build_sdp(has_audio, w, h)
+        # Live camera — no file to check, always available
+        # We use fixed 640x480 for webcam compatibility
+        sdp = self._build_sdp(width=640, height=480)
         self.send_response(200, cseq, {
             "Content-Type":   "application/sdp",
             "Content-Length": str(len(sdp)),
@@ -150,23 +114,18 @@ class RTSPServerWorker(threading.Thread):
             self.send_response(455, cseq, {"Session": self.session_id})
             return
 
-        url = parts[1] if len(parts) > 1 else ""
-        transport = headers.get("transport", "")
-        client_port = self._parse_client_port(transport)
+        transport        = headers.get("transport", "")
+        client_port      = self._parse_client_port(transport)
         self.client_rtp_port = client_port
+        self.state       = STATE_READY
 
-        if self.video_file is None:
-            self.video_file = self._extract_path(url)
-
-        self.state = STATE_READY
         print(f"[RTSP] SETUP: client_rtp_port={client_port}")
-
         self.send_response(200, cseq, {
             "Session":   self.session_id,
             "Transport": (
                 f"RTP/UDP;unicast;"
-                f"client_port={client_port}-{client_port + 1};"
-                f"server_port={client_port}-{client_port + 1}"
+                f"client_port={client_port}-{client_port+1};"
+                f"server_port={client_port+1}-{client_port+2}"
             ),
         })
 
@@ -174,11 +133,10 @@ class RTSPServerWorker(threading.Thread):
         if self.state != STATE_READY:
             self.send_response(455, cseq, {"Session": self.session_id})
             return
-
         self.state = STATE_PLAYING
         self.send_response(200, cseq, {
             "Session":  self.session_id,
-            "RTP-Info": f"url=rtsp://{self.client_address[0]}/{self.video_file};seq=1;rtptime=0",
+            "RTP-Info": f"url=rtsp://{self.client_address[0]}/live;seq=1;rtptime=0",
         })
         self._start_ffmpeg()
 
@@ -193,74 +151,48 @@ class RTSPServerWorker(threading.Thread):
     def handle_teardown(self, parts, headers, cseq):
         self._stop_ffmpeg()
         self.state = STATE_INIT
-        self.elapsed = 0.0
-        self.play_start_time = None
         self.send_response(200, cseq, {"Session": self.session_id})
-
-    def _audio_port(self):
-        return (self.client_rtp_port or DEFAULT_VIDEO_PORT) + AUDIO_PORT_OFFSET
 
     def _start_ffmpeg(self):
         if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
             return
 
         client_ip  = self.client_address[0]
-        video_port = self.client_rtp_port or DEFAULT_VIDEO_PORT
-        audio_port = self._audio_port()
-        has_audio  = self._probe_has_audio(self.video_file)
-        w, h       = self._probe_dimensions(self.video_file)
+        video_port = self.client_rtp_port or 5004
 
-        print(f"[DEBUG] video_port={video_port}, audio_port={audio_port}, has_audio={has_audio}, seek={self.elapsed:.2f}s")
+        # Get the OS-specific webcam capture arguments
+        cam_args = get_camera_input()
 
-        cmd = ["ffmpeg", "-re"]
-        if self.elapsed > 0:
-            cmd += ["-ss", f"{self.elapsed:.2f}"]
-        cmd += [
-            "-i", self.video_file,
-            "-map", "0:v:0",
-            "-vcodec", VIDEO_CODEC,
-            "-preset", VIDEO_PRESET,
-            "-tune", VIDEO_TUNE,
-            "-s", f"{w}x{h}",
-            "-b:v", VIDEO_BITRATE,
-            "-maxrate", VIDEO_MAXRATE,
-            "-bufsize", VIDEO_BUFSIZE,
-            "-g", VIDEO_GOP,
-            "-f", "rtp",
-            f"rtp://{client_ip}:{video_port}",
-        ]
-
-        if has_audio:
-            cmd += [
-                "-map", "0:a:0",
-                "-acodec", AUDIO_CODEC,
-                "-b:a", AUDIO_BITRATE,
-                "-ar", AUDIO_SAMPLE_RATE,
-                "-ac", AUDIO_CHANNELS,
-                "-f", "rtp",
-                f"rtp://{client_ip}:{audio_port}",
+        cmd = (
+            ["ffmpeg"]
+            + cam_args                  # webcam input (OS-specific)
+            + [
+                "-vcodec",  "libx264",
+                "-preset",  "ultrafast",
+                "-tune",    "zerolatency",
+                "-s",       "640x480",   # resolution
+                "-r",       "30",        # 30 frames per second
+                "-b:v",     "800k",
+                "-maxrate", "900k",
+                "-bufsize", "1600k",
+                "-g",       "60",
+                "-f",       "rtp",
+                f"rtp://{client_ip}:{video_port}",
             ]
+        )
 
         print(f"[FFmpeg] Starting: {' '.join(cmd)}")
 
-        kwargs = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-        }
+        kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE}
         if os.name != "nt":
             kwargs["preexec_fn"] = os.setsid
         else:
             kwargs["creationflags"] = 0x08000000
 
         self.ffmpeg_proc = subprocess.Popen(cmd, **kwargs)
-        self.play_start_time = time.time()
         threading.Thread(target=self._log_ffmpeg, daemon=True).start()
 
     def _stop_ffmpeg(self):
-        if self.play_start_time is not None:
-            self.elapsed += time.time() - self.play_start_time
-            self.play_start_time = None
-
         if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
             try:
                 if os.name == "nt":
@@ -270,53 +202,23 @@ class RTSPServerWorker(threading.Thread):
             except Exception as e:
                 print(f"[FFmpeg] Stop error: {e}")
             try:
-                self.ffmpeg_proc.wait(timeout=FFMPEG_STOP_TIMEOUT)
+                self.ffmpeg_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.ffmpeg_proc.kill()
             self.ffmpeg_proc = None
-            print("[FFmpeg] Process stopped.")
+            print("[FFmpeg] Stopped.")
 
     def _log_ffmpeg(self):
         for line in self.ffmpeg_proc.stderr:
             print(f"[FFmpeg] {line.decode(errors='ignore').rstrip()}")
 
-    def _probe_has_audio(self, filepath: str) -> bool:
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=codec_type",
-                 "-of", "csv=p=0", filepath],
-                capture_output=True, text=True, timeout=PROBE_TIMEOUT
-            )
-            return "audio" in result.stdout
-        except Exception:
-            return False
-
-    def _probe_dimensions(self, filepath: str):
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error",
-                 "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height",
-                 "-of", "csv=p=0", filepath],
-                capture_output=True, text=True, timeout=PROBE_TIMEOUT
-            )
-            parts = result.stdout.strip().split(",")
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
-        except Exception:
-            pass
-        return DEFAULT_WIDTH, DEFAULT_HEIGHT
-
-    def _build_sdp(self, has_audio: bool, width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT) -> str:
+    def _build_sdp(self, width=640, height=480):
         ip         = self.client_address[0]
-        video_port = self.client_rtp_port or DEFAULT_VIDEO_PORT
-        audio_port = self._audio_port()
-
-        sdp = (
+        video_port = self.client_rtp_port or 5004
+        return (
             "v=0\r\n"
             f"o=- 0 0 IN IP4 {ip}\r\n"
-            "s=RTSP Stream\r\n"
+            "s=Live Stream\r\n"
             f"c=IN IP4 {ip}\r\n"
             "t=0 0\r\n"
             f"a=x-dimensions:{width},{height}\r\n"
@@ -324,35 +226,22 @@ class RTSPServerWorker(threading.Thread):
             "a=rtpmap:96 H264/90000\r\n"
             "a=control:track1\r\n"
         )
-        if has_audio:
-            sdp += (
-                f"m=audio {audio_port} RTP/AVP 14\r\n"
-                "b=AS:128\r\n"
-                "a=rtpmap:14 MPA/90000\r\n"
-                "a=control:track2\r\n"
-            )
-        return sdp
 
-    def _extract_path(self, url: str) -> str:
-        if url.startswith("rtsp://"):
-            url = url[7:]
-            if "/" in url:
-                return url.split("/", 1)[1].split("/track")[0]
-        return url.lstrip("/").split("/track")[0] or "stream.mp4"
-
-    def _parse_client_port(self, transport: str) -> int:
+    def _parse_client_port(self, transport):
         for part in transport.split(";"):
             if "client_port" in part:
                 try:
-                    ports = part.split("=")[1]
-                    return int(ports.split("-")[0])
-                except (IndexError, ValueError):
+                    return int(part.split("=")[1].split("-")[0])
+                except Exception:
                     pass
-        return DEFAULT_VIDEO_PORT
+        return 5004
 
-    def send_response(self, code: int, cseq: str, headers: dict = None, body: str = ""):
-        reason = RESPONSE_REASONS.get(code, "Unknown")
-        lines = [f"RTSP/1.0 {code} {reason}", f"CSeq: {cseq}"]
+    def send_response(self, code, cseq, headers=None, body=""):
+        reasons = {
+            200: "OK", 404: "Not Found",
+            455: "Method Not Valid in This State", 501: "Not Implemented",
+        }
+        lines = [f"RTSP/1.0 {code} {reasons.get(code, 'Unknown')}", f"CSeq: {cseq}"]
         if headers:
             for k, v in headers.items():
                 lines.append(f"{k}: {v}")
@@ -376,8 +265,8 @@ class RtspServer:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((self.host, self.port))
             srv.listen(10)
-            print(f"[RTSP] Server listening on port {self.port}")
-            print(f"       rtsp://127.0.0.1/your_video.mp4\n")
+            print(f"[RTSP] Live Camera Server on port {self.port}")
+            print(f"       Connect from client: rtsp://<THIS_PC_IP>/live\n")
             try:
                 while True:
                     client_sock, client_addr = srv.accept()
